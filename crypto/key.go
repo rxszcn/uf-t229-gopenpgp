@@ -39,10 +39,11 @@ func NewKeyFromReader(r io.Reader) (key *Key, err error) {
 // Allows to set the encoding explicitly to avoid the armor check.
 func NewKeyFromReaderExplicit(r io.Reader, encoding int8) (key *Key, err error) {
 	var armored bool
+	var replay restartable
 	key = &Key{}
 	switch encoding {
 	case Auto:
-		r, armored = armor.IsPGPArmored(r)
+		r, armored, replay = unarmorInput(Auto, r)
 	case Armor:
 		armored = true
 	case Bytes:
@@ -51,6 +52,13 @@ func NewKeyFromReaderExplicit(r io.Reader, encoding int8) (key *Key, err error) 
 		return nil, errors.New("gopenpgp: encoding is not supported")
 	}
 	err = key.readFrom(r, armored)
+	if err != nil && armored && encoding == Auto && replay != nil {
+		// Armor detection matched structurally but the armored key parse failed.
+		// Rewind and retry as a binary key ring, matching explicit Bytes
+		// behavior for binary data that merely looks like an armor header.
+		replay.Restart()
+		err = key.readFrom(r, false)
+	}
 	if err != nil {
 		return nil, err
 	}

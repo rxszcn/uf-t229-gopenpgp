@@ -3,7 +3,6 @@ package crypto
 import (
 	"bytes"
 	"errors"
-	"fmt"
 
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/gopenpgp/v3/internal"
@@ -163,35 +162,43 @@ func (dh *decryptionHandle) decryptingReader(encryptedMessage Reader, encryptedS
 		return nil, err
 	}
 	var armored bool
-	encryptedMessage, armored = unarmorInput(encoding, encryptedMessage)
+	var replay restartable
+	encryptedMessage, armored, replay = unarmorInput(encoding, encryptedMessage)
 	var armoredBlock *armor.Block
 	if armored {
 		// Wrap encryptedMessage with decode armor reader.
-		armoredBlock, err = armor.Decode(encryptedMessage)
+		armoredBlock, err = decodeArmor(encryptedMessage, replay, encoding, "gopenpgp: unarmor failed for pgp message")
 		if err != nil {
-			err = fmt.Errorf("gopenpgp: unarmor failed for pgp message: %w", err)
 			return nil, err
 		}
-		encryptedMessage = armoredBlock.Body
+		if armoredBlock != nil {
+			encryptedMessage = armoredBlock.Body
+		}
+		// armoredBlock == nil: Auto detection was a false positive. The reader
+		// has been rewound and the binary parser below handles the input.
 	}
 	if encryptedSignature != nil {
-		encryptedSignature, armored = unarmorInput(encoding, encryptedSignature)
+		var sigReplay restartable
+		encryptedSignature, armored, sigReplay = unarmorInput(encoding, encryptedSignature)
 		if armored {
 			// Wrap encryptedSignature with decode armor reader.
-			armoredBlock, err = armor.Decode(encryptedSignature)
+			armoredBlock, err = decodeArmor(encryptedSignature, sigReplay, encoding, "gopenpgp: unarmor failed for pgp encrypted signature message")
 			if err != nil {
-				err = fmt.Errorf("gopenpgp: unarmor failed for pgp encrypted signature message: %w", err)
 				return nil, err
 			}
-			encryptedSignature = armoredBlock.Body
-			if dh.PlainDetachedSignature && armoredBlock.Type != "PGP SIGNATURE" {
-				err = errors.New("gopenpgp: detached signature is not plaintext")
-				return nil, err
+			if armoredBlock != nil {
+				encryptedSignature = armoredBlock.Body
+				if dh.PlainDetachedSignature && armoredBlock.Type != "PGP SIGNATURE" {
+					err = errors.New("gopenpgp: detached signature is not plaintext")
+					return nil, err
+				}
+				if !dh.PlainDetachedSignature && armoredBlock.Type != "PGP MESSAGE" {
+					err = errors.New("gopenpgp: encrypted detached signature is not an encrypted pgp message")
+					return nil, err
+				}
 			}
-			if !dh.PlainDetachedSignature && armoredBlock.Type != "PGP MESSAGE" {
-				err = errors.New("gopenpgp: encrypted detached signature is not an encrypted pgp message")
-				return nil, err
-			}
+			// armoredBlock == nil: Auto detection was a false positive. The
+			// reader has been rewound and the binary parser handles the input.
 		}
 	}
 

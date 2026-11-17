@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	openpgp "github.com/ProtonMail/go-crypto/openpgp/v2"
@@ -49,14 +48,19 @@ func defaultVerifyHandle(profile SignProfile, clock Clock) *verifyHandle {
 // which is verified against the detachedData.
 func (vh *verifyHandle) VerifyingReader(detachedData, signatureMessage Reader, encoding int8) (reader *VerifyDataReader, err error) {
 	var armored bool
-	signatureMessage, armored = unarmorInput(encoding, signatureMessage)
+	var replay restartable
+	signatureMessage, armored, replay = unarmorInput(encoding, signatureMessage)
 	if armored {
 		// Wrap with decode armor reader.
-		armoredBlock, err := armor.Decode(signatureMessage)
-		if err != nil {
-			return nil, fmt.Errorf("gopenpgp: unarmor failed: %w", err)
+		armoredBlock, decodeErr := decodeArmor(signatureMessage, replay, encoding, "gopenpgp: unarmor failed")
+		if decodeErr != nil {
+			return nil, decodeErr
 		}
-		signatureMessage = armoredBlock.Body
+		if armoredBlock != nil {
+			signatureMessage = armoredBlock.Body
+		}
+		// armoredBlock == nil: Auto detection was a false positive. The reader
+		// has been rewound and the binary parser below handles the input.
 	}
 	if detachedData != nil {
 		if vh.IsUTF8 {

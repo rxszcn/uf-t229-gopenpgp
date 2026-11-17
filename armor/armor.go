@@ -3,6 +3,7 @@
 package armor
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -164,22 +165,95 @@ func ArmorPGPMessageChecksum(signature []byte, checksum bool) (string, error) {
 	return ArmorWithTypeChecksum(signature, constants.PGPMessageHeader, checksum)
 }
 
+// armorPrefix is the opening of an OpenPGP armor header line,
+// e.g. "-----BEGIN PGP SIGNATURE-----".
 const armorPrefix = "-----BEGIN PGP"
-const maxGarbageBytes = 128
+const armorSuffix = "-----"
 
-// IsPGPArmored reads a prefix from the reader and checks
-// if it is equal to a pgp armored message prefix.
-// Returns an io.Reader that is reset to the state of the in reader,
-// and a bool that indicates if there is a match.
-// If reading from the reader fails, the returned bool is set to false.
-func IsPGPArmored(in io.Reader) (io.Reader, bool) {
-	buffer := make([]byte, len(armorPrefix)+maxGarbageBytes)
-	n, _ := io.ReadFull(in, buffer)
-	outReader := io.MultiReader(bytes.NewReader(buffer[:n]), in)
-	if bytes.Contains(buffer[:n], []byte(armorPrefix)) {
-		return outReader, true
+// replayableReader replays every byte that has already been consumed from the
+// wrapped reader before serving further bytes from it. Restart rewinds to the
+// very first byte, which allows a failed armor decoding to be retried as a
+// binary parse without consuming the underlying reader twice.
+//
+// pos always tracks the logical read position. Bytes read ahead by the
+// buffering scanner are already stored in buf, so they are replayed correctly
+// after a Restart.
+type replayableReader struct {
+	in io.Reader
+	// buf holds every byte read so far, including bytes read ahead by the
+	// buffering scanner. pos is the logical read position within buf.
+	buf []byte
+	pos int
+}
+
+func (r *replayableReader) Read(p []byte) (int, error) {
+	// Replay buffered bytes first, including data read ahead before Restart.
+	if r.pos < len(r.buf) {
+		n := copy(p, r.buf[r.pos:])
+		r.pos += n
+		return n, nil
 	}
-	return outReader, false
+	n, err := r.in.Read(p)
+	if n > 0 {
+		r.buf = append(r.buf, p[:n]...)
+		r.pos += n
+	}
+	return n, err
+}
+
+// Restart makes subsequent reads start again from the first byte of the stream.
+func (r *replayableReader) Restart() {
+	r.pos = 0
+}
+
+// IsPGPArmored inspects the reader and checks whether it carries a PGP armored
+// message, tolerating an arbitrary-length leading preamble (e.g. mail gateway
+// quote text) before the armor header.
+//
+// Detection is structural rather than a fixed-window substring search: it scans
+// line by line for a full "-----BEGIN PGP ...-----" header line, mirroring the
+// parsing rule of the underlying armor decoder. This both removes the previous
+// 128-byte preamble limit and avoids misclassifying binary data that merely
+// happens to contain the armor marker bytes.
+//
+// It returns an io.Reader that yields the complete, unconsumed input, and a bool
+// that indicates if an armor header was found. If the returned reader was
+// produced by this function, it additionally implements
+//
+//	interface{ Restart() }
+//
+// which rewinds it to the first byte so that callers can fall back to binary
+// parsing after a failed armor decode. If reading from the reader fails, the
+// returned bool is set to false.
+func IsPGPArmored(in io.Reader) (io.Reader, bool) {
+	replay := &replayableReader{in: in}
+	scanner := bufio.NewReader(replay)
+	for {
+		line, err := scanner.ReadBytes('\n')
+		if len(line) > 0 && isArmorHeaderLine(line) {
+			// Rewind the logical position: the buffering scanner has read
+			// ahead into replay.buf, and the caller must see the full input
+			// from its first byte. Restart can rewind again later.
+			replay.Restart()
+			return replay, true
+		}
+		if err != nil {
+			// No armor header before EOF (or a read error): treat the whole
+			// input as binary. The buffered bytes are still replayed verbatim.
+			replay.Restart()
+			return replay, false
+		}
+	}
+}
+
+// isArmorHeaderLine reports whether line, a single line including its trailing
+// newline, is a full OpenPGP armor header line such as
+// "-----BEGIN PGP MESSAGE-----\n".
+func isArmorHeaderLine(line []byte) bool {
+	line = bytes.TrimSpace(line)
+	return bytes.HasPrefix(line, []byte(armorPrefix)) &&
+		bytes.HasSuffix(line, []byte(armorSuffix)) &&
+		len(line) > len(armorPrefix)+len(armorSuffix)
 }
 
 func armorWithTypeAndHeaders(input []byte, armorType string, headers map[string]string, writeChecksum bool) (*bytes.Buffer, error) {
